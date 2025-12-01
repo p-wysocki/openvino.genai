@@ -1,5 +1,4 @@
-# PyArrow GIL finalization workaround - must be first import
-import whowhatbench.pyarrow_workaround  # noqa
+import whowhatbench.pyarrow_workaround
 
 import argparse
 import gc
@@ -839,10 +838,10 @@ def main():
                 os.mkdir(args.output)
             df = pd.DataFrame(all_metrics_per_question)
             df.to_csv(os.path.join(args.output, "metrics_per_question.csv"))
-            del df  # Clean up DataFrame immediately after use
+            del df
             df = pd.DataFrame(all_metrics)
             df.to_csv(os.path.join(args.output, "metrics.csv"))
-            del df  # Clean up DataFrame immediately after use
+            del df
             evaluator.dump_predictions(os.path.join(args.output, "target.csv"))
         
         # Clean up metrics data that may hold PyArrow buffers
