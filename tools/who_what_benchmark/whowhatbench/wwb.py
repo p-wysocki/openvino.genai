@@ -1,4 +1,8 @@
+# PyArrow GIL finalization workaround - must be first import
+import whowhatbench.pyarrow_workaround  # noqa
+
 import argparse
+import gc
 import difflib
 import numpy as np
 import logging
@@ -835,9 +839,14 @@ def main():
                 os.mkdir(args.output)
             df = pd.DataFrame(all_metrics_per_question)
             df.to_csv(os.path.join(args.output, "metrics_per_question.csv"))
+            del df  # Clean up DataFrame immediately after use
             df = pd.DataFrame(all_metrics)
             df.to_csv(os.path.join(args.output, "metrics.csv"))
+            del df  # Clean up DataFrame immediately after use
             evaluator.dump_predictions(os.path.join(args.output, "target.csv"))
+        
+        # Clean up metrics data that may hold PyArrow buffers
+        del all_metrics_per_question, all_metrics
 
     if args.verbose and (args.target_model or args.target_data):
         if args.model_type == "text" or args.model_type == "visual-text":
@@ -849,6 +858,21 @@ def main():
         elif args.model_type in ['text-reranking']:
             print_rag_results(evaluator)
 
+
+    if 'evaluator' in locals():
+        if hasattr(evaluator, 'gt_data'):
+            del evaluator.gt_data
+        if hasattr(evaluator, 'predictions'):
+            del evaluator.predictions
+        if hasattr(evaluator, 'last_cmp'):
+            del evaluator.last_cmp
+        if hasattr(evaluator, 'similarity'):
+            del evaluator.similarity
+        gc.collect()
+        del evaluator
+    if 'target_model' in locals():
+        del target_model
+    gc.collect()
 
 if __name__ == "__main__":
     main()
