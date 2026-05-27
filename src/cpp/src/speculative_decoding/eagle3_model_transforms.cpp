@@ -227,18 +227,18 @@ void transform_hidden_state(std::shared_ptr<ov::Model>& model, const std::vector
         return;
     }
     OPENVINO_ASSERT(
-        hidden_layers_to_abstract.size() == 3 || hidden_layers_to_abstract.size() == 1,
-        "Expected exactly 1 or 3 hidden layers for extraction: 1 for draft model, 3 for main model (early/middle/late stages)."
+        hidden_layers_to_abstract.size() >= 1,
+        "Expected at least 1 hidden layer for extraction, got 0."
     );
 
     std::vector<std::string> patterns;
-    if (hidden_layers_to_abstract.size() > 1) {
+    if (hidden_layers_to_abstract.size() > 1 || hidden_layers_to_abstract[0] >= 0) {
         patterns.reserve(hidden_layers_to_abstract.size());
         for (int32_t idx : hidden_layers_to_abstract) {
             patterns.emplace_back("layers." + std::to_string(idx) + "/"); // main description
         }
     } else {
-        patterns.emplace_back("midlayer"); // draft description
+        patterns.emplace_back("midlayer"); // draft description (layer index == -1)
     }
 
     // Helper: check if node is a residual Add node with expected structure
@@ -253,15 +253,28 @@ void transform_hidden_state(std::shared_ptr<ov::Model>& model, const std::vector
         return false;
     };
 
-    std::vector<ov::Output<ov::Node>> residual_outputs;
+    // Collect residual outputs — keep only the last match per pattern
+    // (post-MLP residual is always last within a layer) to avoid
+    // false positives from attention residuals that happen to match.
+    std::vector<ov::Output<ov::Node>> last_per_pattern(patterns.size());
+    std::vector<bool> found(patterns.size(), false);
+
     for (const auto& node : model->get_ordered_ops()) {
         if (!is_residual_node(node)) continue;
         const std::string& name = node->get_friendly_name();
-        for (const auto& pattern : patterns) {
-            if (name.find(pattern) != std::string::npos) {
-                residual_outputs.push_back(node->output(0));
+        for (size_t i = 0; i < patterns.size(); ++i) {
+            if (name.find(patterns[i]) != std::string::npos) {
+                last_per_pattern[i] = node->output(0);
+                found[i] = true;
                 break;
             }
+        }
+    }
+
+    std::vector<ov::Output<ov::Node>> residual_outputs;
+    for (size_t i = 0; i < patterns.size(); ++i) {
+        if (found[i]) {
+            residual_outputs.push_back(last_per_pattern[i]);
         }
     }
 
