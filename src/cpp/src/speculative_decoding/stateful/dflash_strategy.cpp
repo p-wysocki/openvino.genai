@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <numeric>
 
 #include "openvino/core/type/bfloat16.hpp"
@@ -398,7 +399,7 @@ DFlashDraftWrapper::DFlashDraftWrapper(const ModelDesc& model_desc,
     m_raw_perf_metrics.detokenization_durations = {MicroSeconds(0.0f)};
 }
 
-ov::Tensor DFlashDraftWrapper::infer(const ov::Tensor& input_ids, const ov::Tensor& target_hidden) {
+ov::Tensor DFlashDraftWrapper::infer(const ov::Tensor& input_ids, const ov::Tensor& target_hidden, size_t position_offset) {
     m_request.set_tensor("input_ids", input_ids);
 
     // Convert target_hidden to match draft model's expected precision if needed
@@ -424,9 +425,10 @@ ov::Tensor DFlashDraftWrapper::infer(const ov::Tensor& input_ids, const ov::Tens
         m_request.set_tensor("target_hidden", target_hidden);
     }
 
-    // Position IDs: sequential from 0 to (ctx_len + block_size - 1)
-    // The draft model concatenates target_hidden context with noise tokens internally,
-    // so position_ids must cover both context and block positions.
+    // Position IDs: cover both context and block positions with absolute offsets.
+    // In the reference, position_ids spans [0, ctx_len + block_size - 1] for the first call,
+    // and includes accumulated context from the KV cache. Since we pass accumulated context
+    // directly (no KV cache), positions always start from 0 for the context portion.
     const size_t block_size = input_ids.get_shape()[1];
     const size_t ctx_len = target_hidden.get_shape()[1];
     const size_t total_pos = ctx_len + block_size;
@@ -542,6 +544,8 @@ EncodedResults StatefulDFlashLLMPipeline::generate_tokens(const EncodedInputs& i
     // Reset model states
     m_target->reset_state();
     m_draft->reset_state();
+    m_accumulated_hidden = ov::Tensor();
+    m_draft_position_offset = 0;
 
     // Extend max_new_tokens for sampling config to avoid premature stopping during draft
     auto sampling_config = config;
@@ -559,9 +563,30 @@ EncodedResults StatefulDFlashLLMPipeline::generate_tokens(const EncodedInputs& i
 
     auto streaming_status = stream_generated_tokens(streamer_ptr, initial_tokens);
 
-    // Store hidden features from prefill (last position for context)
-    // We'll store the full hidden features and slice as needed
+    // Store hidden features from prefill and initialize accumulated context
+    // IMPORTANT: Make a deep copy — the tensor from infer() is a reference to an internal
+    // buffer that gets overwritten on subsequent infer() calls.
+    // Store in bf16 to match draft model's expected input dtype and avoid repeated conversions.
     m_target->get_current_sequence()->update_hidden_state(prefill_output.hidden_features);
+    {
+        auto src = prefill_output.hidden_features;
+        // Determine target dtype for accumulation (match draft model input)
+        m_accumulated_hidden = ov::Tensor(ov::element::bf16, src.get_shape());
+        if (src.get_element_type() == ov::element::bf16) {
+            src.copy_to(m_accumulated_hidden);
+        } else {
+            // Convert f32 to bf16
+            const float* s = src.data<float>();
+            auto* d = reinterpret_cast<ov::bfloat16*>(m_accumulated_hidden.data());
+            for (size_t i = 0; i < src.get_size(); ++i) d[i] = ov::bfloat16(s[i]);
+        }
+    }
+    m_draft_position_offset = 0;  // Will be set to prefill hidden length
+
+    // Initialize position offset: the draft model's positions start after the context
+    if (m_accumulated_hidden && m_accumulated_hidden.get_size() > 0) {
+        m_draft_position_offset = m_accumulated_hidden.get_shape()[1];
+    }
 
     // Phase 2: Speculative decoding loop
     size_t generated_tokens = 1;
@@ -645,24 +670,20 @@ StatefulDFlashLLMPipeline::SpeculativeResult StatefulDFlashLLMPipeline::run_spec
     draft_ids_ptr[0] = m_last_accepted_token;  // Anchor token
     std::fill(draft_ids_ptr + 1, draft_ids_ptr + block_size, static_cast<int64_t>(mask_token_id));
 
-    // Step 2: Get target hidden states from last inference
-    auto target_hidden = m_target->get_current_sequence()->get_hidden_state();
-    OPENVINO_ASSERT(target_hidden && target_hidden.get_size() > 0,
-                    "Target model must have hidden state for DFlash drafting");
-
-    // Use the full target hidden features as context for the draft model.
-    // The draft model's attention uses target_hidden as KV context:
-    //   K = [K_proj(target_hidden), K_proj(noise_embedding)]
-    //   V = [V_proj(target_hidden), V_proj(noise_embedding)]
-    // So target_hidden provides the "context" and noise_embedding provides "self" tokens.
-    ov::Tensor context_hidden = target_hidden;
+    // Step 2: Get accumulated target hidden states (full context for draft model)
+    // In the reference implementation, the draft model's KV cache accumulates all prior
+    // context (target_hidden from each iteration). Since our exported draft model has no
+    // KV cache, we pass the full accumulated hidden tensor explicitly.
+    ov::Tensor context_hidden = m_accumulated_hidden;
+    OPENVINO_ASSERT(context_hidden && context_hidden.get_size() > 0,
+                    "Accumulated hidden state must be non-empty for DFlash drafting");
 
     auto ctx_shape = context_hidden.get_shape();
     std::cerr << "[DFlash DEBUG] context_hidden shape: [" << ctx_shape[0] << "," << ctx_shape[1] << "," << ctx_shape[2]
               << "] type=" << context_hidden.get_element_type().get_type_name() << std::endl;
 
-    // Step 3: Single draft forward pass
-    ov::Tensor draft_logits = m_draft->infer(draft_input_ids, context_hidden);
+    // Step 3: Single draft forward pass (position_offset enables correct RoPE positions)
+    ov::Tensor draft_logits = m_draft->infer(draft_input_ids, context_hidden, m_draft_position_offset);
     // draft_logits shape: [1, block_size, vocab_size]
 
     // Step 4: Sample draft tokens from positions 1..block_size-1
@@ -784,14 +805,52 @@ StatefulDFlashLLMPipeline::SpeculativeResult StatefulDFlashLLMPipeline::run_spec
     }
 
     // Step 9: Update hidden states for next iteration
+    // In the reference, target_hidden is sliced to [:, :acceptance_length+1, :]
+    // from the verification output. This is the CURRENT iteration's context.
+    // The draft's KV cache preserves PRIOR context. Since we don't have KV cache in the
+    // draft model, we accumulate all target_hidden across iterations.
     auto new_hidden = val_output.hidden_features;
     if (new_hidden && new_hidden.get_size() > 0) {
         const auto nh_shape = new_hidden.get_shape();
+        // Slice to only the accepted tokens (matching reference: [:, :acceptance_length+1, :])
+        ov::Tensor sliced_hidden = new_hidden;
         if (nh_shape[1] > total_new_tokens) {
             auto [start_coord, end_coord] = ov::genai::utils::make_roi(nh_shape, 1, 0, total_new_tokens);
-            new_hidden = ov::Tensor(new_hidden, start_coord, end_coord);
+            sliced_hidden = ov::Tensor(new_hidden, start_coord, end_coord);
         }
-        m_target->get_current_sequence()->update_hidden_state(new_hidden);
+
+        // Accumulate: concatenate new hidden states with prior accumulated context
+        // Stored in bf16 to match draft model input type
+        const auto acc_shape = m_accumulated_hidden.get_shape();
+        const size_t acc_seq_len = acc_shape[1];
+        const size_t new_seq_len = sliced_hidden.get_shape()[1];
+        const size_t total_seq_len = acc_seq_len + new_seq_len;
+        const size_t feature_dim = acc_shape[2];
+
+        ov::Tensor new_accumulated(ov::element::bf16, {1, total_seq_len, feature_dim});
+
+        // Copy prior accumulated context (already bf16)
+        const size_t acc_bytes = acc_seq_len * feature_dim * sizeof(ov::bfloat16);
+
+        auto* dst = reinterpret_cast<uint8_t*>(new_accumulated.data());
+        std::memcpy(dst, m_accumulated_hidden.data(), acc_bytes);
+
+        // Convert and copy new hidden states to bf16
+        const size_t num_elements = new_seq_len * feature_dim;
+        auto* bf_dst = reinterpret_cast<ov::bfloat16*>(dst + acc_bytes);
+        if (sliced_hidden.get_element_type() == ov::element::bf16) {
+            std::memcpy(bf_dst, sliced_hidden.data(), num_elements * sizeof(ov::bfloat16));
+        } else {
+            // f32 -> bf16
+            const float* src = sliced_hidden.data<float>();
+            for (size_t i = 0; i < num_elements; ++i) bf_dst[i] = ov::bfloat16(src[i]);
+        }
+
+        m_accumulated_hidden = new_accumulated;
+        m_draft_position_offset = total_seq_len;
+
+        // Also update the per-sequence hidden state for backward compat
+        m_target->get_current_sequence()->update_hidden_state(sliced_hidden);
     }
 
     // Update last accepted token for next iteration's anchor

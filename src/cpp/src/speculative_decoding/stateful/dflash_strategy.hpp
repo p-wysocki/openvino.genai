@@ -103,8 +103,9 @@ public:
     /// @brief Single forward pass producing block_size logits
     /// @param input_ids Token IDs [1, block_size] (anchor + MASKs)
     /// @param target_hidden Concatenated hidden states [1, ctx_len, N*H]
+    /// @param position_offset Absolute position offset for position_ids
     /// @return Logits [1, block_size, vocab_size]
-    ov::Tensor infer(const ov::Tensor& input_ids, const ov::Tensor& target_hidden);
+    ov::Tensor infer(const ov::Tensor& input_ids, const ov::Tensor& target_hidden, size_t position_offset = 0);
 
     void trim_kv_cache(size_t tokens_to_remove);
     void reset_state();
@@ -175,6 +176,11 @@ private:
     utils::dflash::DFlashRTInfo m_dflash_config;
     size_t m_prompt_length = 0;
     int64_t m_last_accepted_token = -1;
+
+    // Accumulated target hidden states across iterations (provides context history to draft)
+    ov::Tensor m_accumulated_hidden;
+    // Current sequence position for draft model position_ids
+    size_t m_draft_position_offset = 0;
 };
 
 }  // namespace genai

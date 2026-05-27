@@ -213,6 +213,9 @@ void share_vocabulary_and_lm_head(const std::shared_ptr<ov::Model>& main_model,
         matmul->set_friendly_name("dflash_lm_head");
         result->input(0).replace_source_output(matmul);
 
+        // Name the output tensor "logits" so the runtime can find it by name
+        result->output(0).set_names({"logits"});
+
         std::cerr << "[DFlash DEBUG] Grafted lm_head MatMul: hidden_et=" << hidden_et.get_type_name()
                   << " weight_et=" << weight_et.get_type_name()
                   << " weight_shape=" << cloned_lm_head_weight->get_output_partial_shape(0)
