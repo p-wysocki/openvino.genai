@@ -44,7 +44,8 @@ DFlashRTInfo extract_dflash_info_from_config(ov::AnyMap& config, const std::file
             // Check architectures for DFlashDraftModel
             if (data.contains("architectures") && data["architectures"].is_array()) {
                 for (const auto& arch : data["architectures"]) {
-                    if (arch.get<std::string>() == "DFlashDraftModel") {
+                    auto arch_str = arch.get<std::string>();
+                    if (arch_str == "DFlashDraftModel" || arch_str == "DFlashForExport") {
                         info.dflash_mode = true;
                         break;
                     }

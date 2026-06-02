@@ -111,6 +111,9 @@ public:
     void reset_state();
     void release_memory();
 
+    bool is_stateful() const { return m_is_stateful; }
+    size_t get_kv_cache_len() const { return m_kv_cache_len; }
+
     ov::genai::RawPerfMetrics& get_raw_perf_metrics() { return m_raw_perf_metrics; }
 
 private:
@@ -124,6 +127,8 @@ private:
 
     int m_block_size;
     int m_mask_token_id;
+    bool m_is_stateful = false;
+    size_t m_kv_cache_len = 0;
 
     ov::genai::RawPerfMetrics m_raw_perf_metrics;
 };
@@ -181,6 +186,10 @@ private:
     ov::Tensor m_accumulated_hidden;
     // Current sequence position for draft model position_ids
     size_t m_draft_position_offset = 0;
+    // Tracks the total KV cache length in the draft model (grows by ctx_len + block_size per call)
+    size_t m_draft_kv_cache_len = 0;
+    // Whether draft model is stateful (has internal KV cache)
+    bool m_draft_is_stateful = false;
 };
 
 }  // namespace genai
