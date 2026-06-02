@@ -12,7 +12,9 @@
 
 #include "llm/pipeline_stateful.hpp"
 #include "llm/pipeline_continuous_batching_adapter.hpp"
+#include "speculative_decoding/dflash_model_transforms.hpp"
 #include "speculative_decoding/eagle3_model_transforms.hpp"
+#include "speculative_decoding/stateful/dflash_strategy.hpp"
 #include "speculative_decoding/stateful/eagle3_strategy.hpp"
 #include "speculative_decoding/stateful/fast_draft_strategy.hpp"
 #include "utils.hpp"
@@ -106,6 +108,15 @@ std::pair<std::string, Any> draft_model(
     std::filesystem::path openvino_model_name = "openvino_model.xml";
     auto model = utils::singleton_core().read_model(models_path / openvino_model_name, {}, plugin_config);
     utils::eagle3::apply_eagle3_rt_info(model, plugin_config);
+
+    auto dflash_info = utils::dflash::extract_dflash_info_from_config(plugin_config, models_path);
+    if (dflash_info.dflash_mode) {
+        plugin_config["dflash_mode"] = true;
+        plugin_config["block_size"] = dflash_info.block_size;
+        plugin_config["mask_token_id"] = dflash_info.mask_token_id;
+        plugin_config["target_layer_ids"] = dflash_info.target_layer_ids;
+    }
+
     auto generation_config = utils::from_config_json_if_exists(models_path);
     auto tokenizer = ov::genai::Tokenizer(models_path);
     return { utils::DRAFT_MODEL_ARG_NAME, Any::make<ModelDesc>(model, tokenizer, device, plugin_config, scheduler_config, generation_config) };
@@ -162,6 +173,11 @@ static std::unique_ptr<LLMPipelineImplBase> create(const std::shared_ptr<ov::Mod
     OPENVINO_ASSERT(main_model_descr.model, "Model descriptor must contain a valid model");
 
     if (draft_model_descr.model) {
+        auto dflash_rt_info = utils::dflash::extract_dflash_info_from_config(draft_model_descr.properties, models_path);
+        if (dflash_rt_info.dflash_mode) {
+            return std::make_unique<StatefulDFlashLLMPipeline>(main_model_descr, draft_model_descr, dflash_rt_info);
+        }
+
         // FIXME: Add support for StatefulSpeculativeLLMPipeline for non-NPU devices for both models.
         OPENVINO_ASSERT(device == "NPU" || draft_model_descr.device == "NPU",
                         "Stateful FastDraft and Stateful Eagle3 Speculative Decoding require NPU to be "
@@ -262,7 +278,11 @@ ov::genai::LLMPipeline::LLMPipeline(
     const Tokenizer tokenizer(models_path, properties);
 
     const auto generation_config = utils::from_config_json_if_exists(models_path);
-    if (is_npu_requested) {
+
+    bool has_draft_model = properties.find(utils::DRAFT_MODEL_ARG_NAME) != properties.end();
+    if (has_draft_model) {
+        m_pimpl = StatefulPipeline::create(model, tokenizer, device, properties, generation_config, models_path);
+    } else if (is_npu_requested) {
         m_pimpl = StatefulPipeline::create(model, tokenizer, device, properties, generation_config, models_path);
     } else if (utils::explicitly_requires_paged_attention(user_properties)) {
         // If CB is invoked explicitly, create CB adapter as is and re-throw in case if internal issues

@@ -825,10 +825,16 @@ bool explicitly_requires_paged_attention(const ov::AnyMap& properties, bool is_n
     }
 
     if (properties.find(utils::DRAFT_MODEL_ARG_NAME) != properties.end() && !is_npu_requested) {
-        if (is_paged_attention_available()) {
-            return true;
-        } else {
-            OPENVINO_THROW("Speculative decoding requires PagedAttention operation support on non-NPU devices, which is available on x86_64 or ARM64 platforms only");
+        // DFlash uses stateful pipeline and doesn't require PA backend
+        auto draft_desc = properties.at(utils::DRAFT_MODEL_ARG_NAME).as<ov::genai::ModelDesc>();
+        bool is_dflash = draft_desc.properties.find("dflash_mode") != draft_desc.properties.end() &&
+                         draft_desc.properties.at("dflash_mode").as<bool>();
+        if (!is_dflash) {
+            if (is_paged_attention_available()) {
+                return true;
+            } else {
+                OPENVINO_THROW("Speculative decoding requires PagedAttention operation support on non-NPU devices, which is available on x86_64 or ARM64 platforms only");
+            }
         }
     }
 
